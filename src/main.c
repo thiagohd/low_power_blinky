@@ -12,64 +12,130 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/logging/log.h>
+#include "power_management.h"
+
+
 #define LOG_LEVEL CONFIG_LOG_DEFAULT_LEVEL
 LOG_MODULE_REGISTER(blinky_low_power);
 /* 1000 msec = 1 sec */
 #define SLEEP_TIME_MS   2000
 
-/* The devicetree node identifier for the "led0" alias. */
-#define LED0_NODE DT_ALIAS(led0)
-#define LED1_NODE DT_ALIAS(led1)
-#define LED2_NODE DT_ALIAS(led2)
-#define LED3_NODE DT_ALIAS(led3)
 
-/*
- * A build error on this line means your board is unsupported.
- * See the sample documentation for information on how to fix this.
- */
-static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
-static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
-static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(LED2_NODE, gpios);
-static const struct gpio_dt_spec led3 = GPIO_DT_SPEC_GET(LED3_NODE, gpios);
-
-const struct device *xdev_uart;
+const struct device *gpio0;
+const struct device *gpio1;
+const struct device *xdev_spi;
 const struct device *xdev_uart1;
+const struct device *lora_dev = DEVICE_DT_GET(DT_NODELABEL(lora));
 
-void XTF_TURN_ON(){
-	pm_device_action_run(xdev_uart, PM_DEVICE_ACTION_RESUME);
-	pm_device_action_run(xdev_uart1, PM_DEVICE_ACTION_RESUME);
-	LOG_INF("UART START");
+// void XTF_TURN_ON(){
+// 	pm_device_action_run(xdev_spi, PM_DEVICE_ACTION_RESUME);
+// 	pm_device_action_run(xdev_uart, PM_DEVICE_ACTION_RESUME);
+// 	pm_device_action_run(xdev_uart1, PM_DEVICE_ACTION_RESUME);
+// 	LOG_INF("UART START");
 	
-} 	
+// } 	
 
-void XTF_TURN_OFF(){
-	LOG_INF("UART STOP");
-	pm_device_action_run(xdev_uart, PM_DEVICE_ACTION_SUSPEND);
-	pm_device_action_run(xdev_uart1, PM_DEVICE_ACTION_SUSPEND);
+// void XTF_TURN_OFF(){
+// 	LOG_INF("UART STOP");
+// 	pm_device_action_run(xdev_spi, PM_DEVICE_ACTION_SUSPEND);
+// 	pm_device_action_run(xdev_uart, PM_DEVICE_ACTION_SUSPEND);
+// 	pm_device_action_run(xdev_uart1, PM_DEVICE_ACTION_SUSPEND);
+// }
+static inline int wrapper_lora_recv(const struct device *dev, uint8_t *data, uint8_t size, k_timeout_t timeout, int16_t *rssi, int8_t *snr)
+{
+#if 0 && SIMULATE_LORA
+	return 0;
+#else
+	return lora_recv(dev, data, size, timeout, rssi, snr);
+#endif
+}
+
+static inline int wrapper_lora_send(const struct device *dev, uint8_t *data, uint32_t data_len)
+{
+#if SIMULATE_LORA
+	return 0;
+#else
+	return lora_send(dev, data, data_len);
+#endif
+}
+int wrapper_config_lora_tx(const struct device *lora_device, struct lora_modem_config *config)
+{
+	int ret;
+	if (lora_device == NULL || config == NULL)
+	{
+		LOG_ERR("lora_dev = %08X; config = %08X", (uint32_t)lora_device, (uint32_t)config);
+		return -1;
+	}
+#if SIMULATE_LORA
+	ret = 0;
+#else
+	ret = lora_config(lora_device, config);
+#endif
+	return ret;
+}
+
+struct lora_modem_config config;
+int config_lora_tx(bool set_tx)
+{
+	if (lora_dev == NULL)
+	{
+		LOG_ERR("Erro fatal no LoRa!");
+		return -1;
+	}
+	config.frequency = 915000000;
+	config.bandwidth = BW_125_KHZ;
+	config.datarate = SF_7;
+	config.preamble_len = 8;
+	config.coding_rate = CR_4_5;
+	config.tx_power = 20;
+	config.tx = set_tx;
+	int ret = wrapper_config_lora_tx(lora_dev, &config);
+	k_sleep(K_MSEC(1));
+	return ret;
 }
 
 
 void main(void)
 {
-	int ret;
+	int ret, rssi, snr;
+	uint8_t buff[10];
 	const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 	const struct device *gpio1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
-	xdev_uart = DEVICE_DT_GET(DT_NODELABEL(uart0));
 	xdev_uart1 = DEVICE_DT_GET(DT_NODELABEL(uart1));
-	__ASSERT(xdev_uart, "Falhou ao pegar ponteiro para a UART1");
-	if (!device_is_ready(gpio0) || !device_is_ready(gpio1)){
-		//return;
+	xdev_spi = DEVICE_DT_GET(DT_NODELABEL(spi1));
+	__ASSERT(xdev_uart1, "Falhou ao pegar ponteiro para a UART1");
+	__ASSERT(xdev_spi, "Falhou ao pegar ponteiro para a SPI");
+
+	
+	while (!device_is_ready(xdev_uart1) || !device_is_ready(xdev_spi) ||!device_is_ready(gpio0) || !device_is_ready(gpio1)){
+		LOG_ERR("Dispositivos nao estao prontos");
+		k_msleep(100);
 	}
-	if (!device_is_ready(led0.port) || !device_is_ready(led1.port) ||
-		!device_is_ready(led2.port) || !device_is_ready(led3.port)) {
-		return;
+	if (NRF_UICR->REGOUT0 != UICR_REGOUT0_VOUT_3V0)
+	{
+		NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen << NVMC_CONFIG_WEN_Pos;
+		while (NRF_NVMC->READY == NVMC_READY_READY_Busy)
+		{
+		}
+		NRF_UICR->REGOUT0 = UICR_REGOUT0_VOUT_3V0;
+		NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren << NVMC_CONFIG_WEN_Pos;
+		while (NRF_NVMC->READY == NVMC_READY_READY_Busy)
+		{
+		}
 	}
+	nrf_power_dcdcen_set(NRF_POWER, false);
+	nrf_power_dcdcen_vddh_set(NRF_POWER, false);
+	k_msleep(5000);
+	save_all_pins();
 	//pm_device_init_suspended(gpio0);
 	//pm_device_runtime_enable(gpio0);
 	while (1) {		
 		//pm_device_runtime_put_async(gpio0, PM_DEVICE_ACTION_RESUME);
 		
-		XTF_TURN_ON();
+		XTF_TURN_OFF(xdev_uart1, xdev_spi, gpio0, gpio1);
+		// wrapper_lora_send(xdev_spi, "Teste", 5);
+		// config_lora_tx(false);
+		// wrapper_lora_recv(xdev_spi, buff, 5, K_MSEC(5000), &rssi, &snr);
 		//pm_device_action_run(gpio0, PM_DEVICE_ACTION_RESUME);
 		//pm_device_runtime_get(gpio0);
 		k_msleep(100);
@@ -93,11 +159,12 @@ void main(void)
 		// pm_device_action_run(gpio0, PM_DEVICE_ACTION_SUSPEND);
 		// pm_device_action_run(gpio1, PM_DEVICE_ACTION_SUSPEND);
 		//pm_device_runtime_put(gpio0);
-		XTF_TURN_OFF();
 		
 		LOG_INF("UART TRASH1");	
 		LOG_INF("UART TRASH2");	
 		LOG_INF("UART TRASH3");	
+		XTF_TURN_ON(xdev_uart1, xdev_spi, gpio0, gpio1);
+		config_lora_tx(true);
 		k_msleep(SLEEP_TIME_MS);
 		LOG_INF("UART TRASH4");	
 	}
